@@ -1,0 +1,167 @@
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+try:
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/wordnet')
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('punkt')
+    nltk.download('wordnet')
+    nltk.download('stopwords')
+
+TRANSCRIPTS_CSV = 'transcripts.csv'
+FINANCIALS_CSV  = 'financials.csv'
+MODEL_OUT = 'fraud_detection_model.joblib'
+
+lemmatizer = WordNetLemmatizer()
+stop_words = set(stopwords.words('english'))
+analyzer = SentimentIntensityAnalyzer()
+
+def preprocess_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    tokens = word_tokenize(text)
+    tokens = [t.lower() for t in tokens if t.isalpha()]
+    tokens = [t for t in tokens if t not in stop_words]
+    tokens = [lemmatizer.lemmatize(t) for t in tokens]
+    return " ".join(tokens)
+
+def extract_nlp_features(text: str) -> dict:
+    cleaned = preprocess_text(text)
+    words = cleaned.split()
+    word_count = len(words)
+    avg_word_len = np.mean([len(w) for w in words]) if words else 0
+    vader_scores = analyzer.polarity_scores(text if isinstance(text, str) else "")
+    return {
+        'cleaned_text': cleaned,
+        'word_count': word_count,
+        'avg_word_len': avg_word_len,
+        'vader_neg': vader_scores.get('neg', 0.0),
+        'vader_neu': vader_scores.get('neu', 0.0),
+        'vader_pos': vader_scores.get('pos', 0.0),
+        'vader_compound': vader_scores.get('compound', 0.0),
+    }
+
+def load_and_merge(transcripts_path=TRANSCRIPTS_CSV, financials_path=FINANCIALS_CSV):
+    transcripts = pd.read_csv(transcripts_path, parse_dates=['date'])
+    financials = pd.read_csv(financials_path, parse_dates=['date'])
+    required_transcript_cols = {'company_id', 'date', 'transcript_text'}
+    required_fin_cols = {'company_id', 'date', 'EPS', 'ROA', 'ProfitMargin', 'label'}
+    if not required_transcript_cols.issubset(transcripts.columns):
+        raise ValueError(f"Transcripts CSV must contain columns: {required_transcript_cols}")
+    if not required_fin_cols.issubset(financials.columns):
+        raise ValueError(f"Financials CSV must contain columns: {required_fin_cols}")
+    nlp_feat_rows = []
+    for idx, row in transcripts.iterrows():
+        feats = extract_nlp_features(row['transcript_text'])
+        feats.update({'company_id': row['company_id'], 'date': row['date']})
+        nlp_feat_rows.append(feats)
+    nlp_df = pd.DataFrame(nlp_feat_rows)
+    merged = pd.merge(financials, nlp_df, on=['company_id', 'date'], how='inner')
+    if merged.empty:
+        raise ValueError('Merged dataset is empty. Check keys and date formats in your CSVs.')
+    merged = merged.dropna(subset=['label'])
+    return merged
+
+def build_and_evaluate_model(df: pd.DataFrame, save_model_path=MODEL_OUT):
+    feature_cols = ['EPS', 'ROA', 'ProfitMargin', 'word_count', 'avg_word_len',
+                    'vader_neg', 'vader_neu', 'vader_pos', 'vader_compound']
+    X = df[feature_cols].fillna(0)
+    y = df['label'].astype(int)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    models = {
+        'logreg': LogisticRegression(max_iter=1000, class_weight='balanced'),
+        'rf': RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=42)
+    }
+    results = {}
+    for name, model in models.items():
+        model.fit(X_train_scaled, y_train)
+        preds = model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, preds)
+        results[name] = {'model': model, 'accuracy': acc, 'preds': preds}
+        print(f"Model: {name}  Accuracy: {acc:.4f}")
+        print(classification_report(y_test, preds))
+    best_name = max(results.keys(), key=lambda k: results[k]['accuracy'])
+    best_model = results[best_name]['model']
+    print(f"Best model: {best_name} with accuracy {results[best_name]['accuracy']:.4f}")
+    joblib.dump({'scaler': scaler, 'model': best_model, 'feature_cols': feature_cols}, save_model_path)
+    print(f"Saved model to: {save_model_path}")
+    cm = confusion_matrix(y_test, results[best_name]['preds'])
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title(f'Confusion Matrix - {best_name}')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.show()
+    return results[best_name]
+
+def plot_correlation_and_discrepancies(df: pd.DataFrame):
+    cols_of_interest = ['EPS', 'ROA', 'ProfitMargin', 'vader_compound', 'vader_pos', 'vader_neg', 'word_count']
+    corr_df = df[cols_of_interest].corr()
+    plt.figure(figsize=(8,6))
+    sns.heatmap(corr_df, annot=True, fmt='.2f', cmap='coolwarm')
+    plt.title('Correlation matrix: Financial ratios vs sentiment features')
+    plt.tight_layout()
+    plt.show()
+    potential_discrepancies = df[(df['vader_compound'] > 0.3) & (df['EPS'] < 0)]
+    print(f"Potential discrepancies (positive sentiment but negative EPS): {len(potential_discrepancies)} rows")
+    if not potential_discrepancies.empty:
+        display_cols = ['company_id', 'date', 'EPS', 'ROA', 'ProfitMargin', 'vader_compound']
+        print(potential_discrepancies[display_cols].head(20).to_string(index=False))
+    return corr_df, potential_discrepancies
+
+def predict_for_transcript(model_bundle_path: str, transcript_text: str, financial_row: dict):
+    bundle = joblib.load(model_bundle_path)
+    scaler = bundle['scaler']
+    model = bundle['model']
+    cols = bundle['feature_cols']
+    nlp_feats = extract_nlp_features(transcript_text)
+    row = {
+        'EPS': financial_row.get('EPS', 0),
+        'ROA': financial_row.get('ROA', 0),
+        'ProfitMargin': financial_row.get('ProfitMargin', 0),
+        'word_count': nlp_feats['word_count'],
+        'avg_word_len': nlp_feats['avg_word_len'],
+        'vader_neg': nlp_feats['vader_neg'],
+        'vader_neu': nlp_feats['vader_neu'],
+        'vader_pos': nlp_feats['vader_pos'],
+        'vader_compound': nlp_feats['vader_compound'],
+    }
+    X = np.array([row[c] for c in cols]).reshape(1, -1)
+    Xs = scaler.transform(X)
+    if hasattr(model, 'predict_proba'):
+        prob = model.predict_proba(Xs)[0,1]
+    else:
+        prob = None
+    pred = model.predict(Xs)[0]
+    return {'pred': int(pred), 'probability': float(prob) if prob is not None else None}
+
+if __name__ == '__main__':
+    print('Loading and merging data...')
+    merged_df = load_and_merge()
+    print(f'Merged dataset shape: {merged_df.shape}')
+    print('\nPlotting correlation matrix and detecting discrepancies...')
+    corr_df, discrepancies = plot_correlation_and_discrepancies(merged_df)
+    print('\nTraining and evaluating model...')
+    best = build_and_evaluate_model(merged_df)
+    print('\nDone.')
